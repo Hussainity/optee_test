@@ -10076,3 +10076,168 @@ out_close_lib:
 }
 ADBG_CASE_DEFINE(pkcs11, 1030, xtest_pkcs11_test_1030,
 		 "PKCS11: Test AES-GCM Encryption/Decryption");
+
+/*
+ * AES-GCM key wrap / unwrap.
+ *
+ * Wrap a generated AES key with another AES key using CKM_AES_GCM, unwrap it
+ * back, and assert the round-trip preserves the key bytes. Also verify that
+ * tampering with the GCM tag causes unwrap to fail authentication.
+ */
+static void xtest_pkcs11_test_1031(ADBG_Case_t *c)
+{
+	CK_RV rv = CKR_GENERAL_ERROR;
+	CK_SLOT_ID slot = 0;
+	CK_SESSION_HANDLE session = CK_INVALID_HANDLE;
+	CK_FLAGS session_flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+	CK_OBJECT_HANDLE wrapping_key = CK_INVALID_HANDLE;
+	CK_OBJECT_HANDLE key = CK_INVALID_HANDLE;
+	CK_OBJECT_HANDLE unwrapped_key = CK_INVALID_HANDLE;
+	CK_ATTRIBUTE wrapping_key_template[] = {
+		{ CKA_VALUE_LEN, &(CK_ULONG){ 16 }, sizeof(CK_ULONG) },
+		{ CKA_WRAP, &(CK_BBOOL){ CK_TRUE }, sizeof(CK_BBOOL) },
+		{ CKA_UNWRAP, &(CK_BBOOL){ CK_TRUE }, sizeof(CK_BBOOL) },
+	};
+	CK_ATTRIBUTE key_template[] = {
+		{ CKA_VALUE_LEN, &(CK_ULONG){ 16 }, sizeof(CK_ULONG) },
+		{ CKA_EXTRACTABLE, &(CK_BBOOL){ CK_TRUE }, sizeof(CK_BBOOL) },
+		{ CKA_SENSITIVE, &(CK_BBOOL){ CK_FALSE }, sizeof(CK_BBOOL) },
+	};
+	CK_ATTRIBUTE new_key_template[] = {
+		{ CKA_CLASS, &(CK_OBJECT_CLASS){ CKO_SECRET_KEY },
+		  sizeof(CK_OBJECT_CLASS) },
+		{ CKA_KEY_TYPE,	&(CK_KEY_TYPE){ CKK_GENERIC_SECRET },
+		  sizeof(CK_KEY_TYPE) },
+		{ CKA_EXTRACTABLE, &(CK_BBOOL){ CK_TRUE }, sizeof(CK_BBOOL) },
+		{ CKA_SENSITIVE, &(CK_BBOOL){ CK_FALSE }, sizeof(CK_BBOOL) },
+	};
+	uint8_t orig_val[WRAPPED_TEST_KEY_SIZE] = { 0 };
+	CK_ULONG orig_len = 0;
+	uint8_t unwrapped_val[WRAPPED_TEST_KEY_SIZE] = { 0 };
+	CK_ULONG unwrapped_len = 0;
+	CK_ATTRIBUTE get_orig[] = {
+		{ CKA_VALUE_LEN, &orig_len, sizeof(orig_len) },
+		{ CKA_VALUE, orig_val, sizeof(orig_val) },
+	};
+	CK_ATTRIBUTE get_unwrapped[] = {
+		{ CKA_VALUE_LEN, &unwrapped_len, sizeof(unwrapped_len) },
+		{ CKA_VALUE, unwrapped_val, sizeof(unwrapped_val) },
+	};
+	uint8_t buf[WRAPPED_TEST_KEY_SIZE + AES_GCM_TAG_SIZE] = { 0 };
+	CK_ULONG size = 0;
+	CK_ULONG required = 0;
+	CK_ULONG plaintext_len = 16;
+	CK_ULONG expected_wrapped_len = plaintext_len + AES_GCM_TAG_SIZE;
+	CK_BYTE saved_tag_byte = 0;
+	uint8_t *tag_byte = NULL;
+
+	rv = init_lib_and_find_token_slot(&slot, PIN_AUTH);
+	if (!ADBG_EXPECT_CK_OK(c, rv))
+		return;
+
+	rv = init_test_token_pin_auth(slot);
+	if (!ADBG_EXPECT_CK_OK(c, rv))
+		goto close_lib;
+
+	rv = init_user_test_token_pin_auth(slot);
+	if (!ADBG_EXPECT_CK_OK(c, rv))
+		goto close_lib;
+
+	rv = C_OpenSession(slot, session_flags, NULL, 0, &session);
+	if (!ADBG_EXPECT_CK_OK(c, rv))
+		goto close_lib;
+
+	rv = C_GenerateKey(session, &cktest_aes_keygen_mechanism,
+			   wrapping_key_template,
+			   ARRAY_SIZE(wrapping_key_template), &wrapping_key);
+	if (!ADBG_EXPECT_CK_OK(c, rv))
+		goto close_session;
+
+	rv = C_GenerateKey(session, &cktest_aes_keygen_mechanism,
+			   key_template, ARRAY_SIZE(key_template), &key);
+	if (!ADBG_EXPECT_CK_OK(c, rv))
+		goto close_session;
+
+	Do_ADBG_BeginSubCase(c, "Probe wrapped size with NULL buffer");
+
+	rv = C_WrapKey(session, &cktest_aes_gcm_mechanism, wrapping_key, key,
+		       NULL, &required);
+	if (!ADBG_EXPECT_CK_OK(c, rv) ||
+	    !ADBG_EXPECT_COMPARE_UNSIGNED(c, required, ==,
+					  expected_wrapped_len))
+		goto out;
+
+	Do_ADBG_EndSubCase(c, NULL);
+
+	Do_ADBG_BeginSubCase(c, "Wrap key with AES-GCM");
+
+	size = AES_GCM_TAG_SIZE;
+	rv = C_WrapKey(session, &cktest_aes_gcm_mechanism, wrapping_key, key,
+		       buf, &size);
+	if (!ADBG_EXPECT_CK_RESULT(c, CKR_BUFFER_TOO_SMALL, rv) ||
+	    !ADBG_EXPECT_COMPARE_UNSIGNED(c, size, ==, expected_wrapped_len))
+		goto out;
+
+	size = sizeof(buf);
+	rv = C_WrapKey(session, &cktest_aes_gcm_mechanism, wrapping_key, key,
+		       buf, &size);
+	if (!ADBG_EXPECT_CK_OK(c, rv) ||
+	    !ADBG_EXPECT_COMPARE_UNSIGNED(c, size, ==, expected_wrapped_len))
+		goto out;
+
+	rv = C_GetAttributeValue(session, key, get_orig, ARRAY_SIZE(get_orig));
+	if (!ADBG_EXPECT_CK_OK(c, rv))
+		goto out;
+
+	Do_ADBG_EndSubCase(c, NULL);
+
+	Do_ADBG_BeginSubCase(c, "Unwrap key with AES-GCM");
+
+	rv = C_UnwrapKey(session, &cktest_aes_gcm_mechanism, wrapping_key, buf,
+			 size, new_key_template, ARRAY_SIZE(new_key_template),
+			 &unwrapped_key);
+	if (!ADBG_EXPECT_CK_OK(c, rv))
+		goto out;
+
+	rv = C_GetAttributeValue(session, unwrapped_key, get_unwrapped,
+				 ARRAY_SIZE(get_unwrapped));
+	if (!ADBG_EXPECT_CK_OK(c, rv) ||
+	    !ADBG_EXPECT_BUFFER(c, orig_val, orig_len, unwrapped_val,
+				unwrapped_len))
+		goto out;
+
+	rv = C_DestroyObject(session, unwrapped_key);
+	unwrapped_key = CK_INVALID_HANDLE;
+	if (!ADBG_EXPECT_CK_OK(c, rv))
+		goto out;
+
+	Do_ADBG_EndSubCase(c, NULL);
+
+	Do_ADBG_BeginSubCase(c, "Unwrap with tampered GCM tag fails");
+
+	tag_byte = &buf[size - 1];
+	saved_tag_byte = *tag_byte;
+	*tag_byte ^= 0xff;
+
+	rv = C_UnwrapKey(session, &cktest_aes_gcm_mechanism, wrapping_key, buf,
+			 size, new_key_template, ARRAY_SIZE(new_key_template),
+			 &unwrapped_key);
+	*tag_byte = saved_tag_byte;
+	if (!ADBG_EXPECT_TRUE(c, rv != CKR_OK) ||
+	    !ADBG_EXPECT_COMPARE_UNSIGNED(c, unwrapped_key, ==, CK_INVALID_HANDLE))
+		goto out;
+
+	Do_ADBG_EndSubCase(c, NULL);
+
+out:
+	if (unwrapped_key != CK_INVALID_HANDLE)
+		ADBG_EXPECT_CK_OK(c, C_DestroyObject(session, unwrapped_key));
+	ADBG_EXPECT_CK_OK(c, C_DestroyObject(session, key));
+	ADBG_EXPECT_CK_OK(c, C_DestroyObject(session, wrapping_key));
+close_session:
+	ADBG_EXPECT_CK_OK(c, C_CloseSession(session));
+close_lib:
+	ADBG_EXPECT_CK_OK(c, close_lib());
+}
+ADBG_CASE_DEFINE(pkcs11, 1031, xtest_pkcs11_test_1031,
+		 "PKCS11: AES-GCM Key Wrap/UnWrap tests");
